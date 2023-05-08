@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,25 +29,37 @@ func main() {
 	apiKey := strings.TrimSpace(string(apiKeyBytes))
 
 	f := GetFileInfo(filename, apiKey)
-	SearchSubtitles(f, filename, apiKey)
+	subtitle := SearchSubtitles(f, filename, apiKey)
+	DownloadSubtitle(subtitle, apiKey)
 }
 
-func SearchSubtitles(f *FileInfo, filename, apiKey string) {
+func DownloadSubtitle(subtitle *Subtitle, apiKey string) {
+	var jsonBody DownloadRequest = DownloadRequest{
+		file_id: subtitle.Attributes.Files[0].FileId,
+	}
+
+	response := &DownloadResponse{}
+
+	println("Download subtitle", subtitle.Attributes.Files[0].FileId)
+	HttpPostJson("https://api.opensubtitles.com/api/v1/download", jsonBody, apiKey, response)
+
+	println(json.MarshalIndent(response, "", "  "))
+}
+
+func SearchSubtitles(f *FileInfo, filename, apiKey string) *Subtitle {
 	query := GetQueryValues(f, filename)
 	subtitles := &SearchResponse{}
-	DoRequest("https://api.opensubtitles.com/api/v1/subtitles", query, apiKey, subtitles)
+	HttpGetJson("https://api.opensubtitles.com/api/v1/subtitles", query, apiKey, subtitles)
+
+	if len(subtitles.Data) == 0 {
+		panic("No subtitles found.")
+	}
 
 	fmt.Printf("Found %d subtitles.\n", subtitles.TotalCount)
 
-	for _, subtitle := range subtitles.Data {
-		fmt.Printf("%s\t%d\t%t\n", subtitle.Attributes.Files[0].FileName, subtitle.Attributes.DownloadCount, subtitle.Attributes.HearingImpaired)
-	}
+	var bestSubtitleIndex int = -1
 
-	println("------")
-
-	var bestSubtitle *Subtitle
-
-	for _, subtitle := range subtitles.Data {
+	for index, subtitle := range subtitles.Data {
 		if len(subtitle.Attributes.Files) != 1 {
 			continue
 		}
@@ -61,42 +74,62 @@ func SearchSubtitles(f *FileInfo, filename, apiKey string) {
 
 		switch f.Source {
 		case "Blu-Ray":
-			if !strings.Contains(subFileName, "bluray") {
+			if !strings.Contains(subFileName, ".bluray.") && !strings.Contains(subFileName, ".blu-ray.") {
 				continue
 			}
 		case "WEB-DL":
-			if !strings.Contains(subFileName, "web-dl") {
+			if !strings.Contains(subFileName, ".web-dl.") && !strings.Contains(subFileName, ".webdl.") {
 				continue
 			}
 		case "WEBRip":
-			if !strings.Contains(subFileName, "webrip") {
+			if !strings.Contains(subFileName, ".webrip.") && !strings.Contains(subFileName, ".web-rip.") {
 				continue
 			}
 		case "HDTV":
-			if !strings.Contains(subFileName, "hdtv") {
+			if !strings.Contains(subFileName, ".hdtv.") {
 				continue
 			}
 		}
 
-		if bestSubtitle == nil {
-			bestSubtitle = &subtitle
+		if !strings.Contains(subFileName, fmt.Sprintf(".%s.", f.ScreenSize)) {
 			continue
 		}
 
+		if bestSubtitleIndex == -1 {
+			bestSubtitleIndex = index
+			continue
+		}
+
+		bestSubtitle := subtitles.Data[bestSubtitleIndex]
+
 		//  Prefer non-hearing impaired subtitles.
 		if bestSubtitle.Attributes.HearingImpaired && !subtitle.Attributes.HearingImpaired {
-			bestSubtitle = &subtitle
+			bestSubtitleIndex = index
 			continue
 		}
 
 		// Prefer subtitles with more downloads.
 		if bestSubtitle.Attributes.DownloadCount < subtitle.Attributes.DownloadCount {
-			bestSubtitle = &subtitle
+			bestSubtitleIndex = index
 			continue
 		}
 	}
 
-	fmt.Printf("%s %d %t\n", bestSubtitle.Attributes.Files[0].FileName, bestSubtitle.Attributes.DownloadCount, bestSubtitle.Attributes.HearingImpaired)
+	if bestSubtitleIndex == -1 {
+		panic("No subtitles found.")
+	}
+
+	bestSubtitle := subtitles.Data[bestSubtitleIndex]
+
+	hi := ""
+
+	if bestSubtitle.Attributes.HearingImpaired {
+		hi = "(HI) "
+	}
+
+	fmt.Printf("Best subtitle: %s %s(x%d)\n", bestSubtitle.Attributes.Files[0].FileName, hi, bestSubtitle.Attributes.DownloadCount)
+
+	return &bestSubtitle
 }
 
 func GetQueryValues(f *FileInfo, filename string) *url.Values {
@@ -129,25 +162,56 @@ func GetFileInfo(filename string, apiKey string) *FileInfo {
 	query := url.Values{
 		"filename": {filename},
 	}
-	DoRequest("https://api.opensubtitles.com/api/v1/utilities/guessit", &query, apiKey, fileInfo)
+	HttpGetJson("https://api.opensubtitles.com/api/v1/utilities/guessit", &query, apiKey, fileInfo)
 
 	return fileInfo
 }
 
-func DoRequest(url string, query *url.Values, apiKey string, v any) {
+func HttpGetJson(url string, query *url.Values, apiKey string, res interface{}) {
+	body := DoRequest(url, "GET", query, nil, apiKey)
+
+	parseErr := json.Unmarshal(body, res)
+
+	if parseErr != nil {
+		panic(parseErr)
+	}
+}
+
+func HttpPostJson(url string, jsonBody interface{}, apiKey string, res interface{}) {
+	body := DoRequest(url, "POST", nil, jsonBody, apiKey)
+
+	parseErr := json.Unmarshal(body, res)
+
+	if parseErr != nil {
+		panic(parseErr)
+	}
+}
+
+func DoRequest(url, method string, query *url.Values, jsonBody interface{}, apiKey string) []byte {
 	client := &http.Client{}
 
-	u := url + "?" + query.Encode()
+	urlQuery := ""
+	if query != nil {
+		urlQuery = "?" + query.Encode()
+	}
 
-	fmt.Printf("Requesting %s\n", strings.ToLower(u))
+	var reqBody io.Reader = nil
+	if jsonBody != nil {
+		b, e := json.Marshal(jsonBody)
+		if e != nil {
+			panic(e)
+		}
+		reqBody = bytes.NewReader(b)
+	}
 
-	req, reqErr := http.NewRequest("GET", u, nil)
+	req, reqErr := http.NewRequest(method, url+urlQuery, reqBody)
 
 	if reqErr != nil {
 		panic(reqErr)
 	}
 
 	req.Header.Add("Api-Key", apiKey)
+	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", apiKey))
 
 	res, resErr := client.Do(req)
 
@@ -157,25 +221,31 @@ func DoRequest(url string, query *url.Values, apiKey string, v any) {
 
 	defer res.Body.Close()
 
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		panic(fmt.Sprintf("Request failed with status code %d", res.StatusCode))
+	}
+
 	body, readErr := ioutil.ReadAll(res.Body)
 
 	if readErr != nil && readErr != io.EOF {
 		panic(readErr)
 	}
 
-	parseErr := json.Unmarshal(body, v)
+	return body
+}
 
-	if parseErr != nil {
-		panic(parseErr)
-	}
+type DownloadRequest struct {
+	file_id int
+}
 
-	// s, e := json.MarshalIndent(v, "", "  ")
-
-	// if e != nil {
-	// 	panic(e)
-	// }
-
-	// println(string(s))
+type DownloadResponse struct {
+	Link         string `json:"link"`
+	FileName     string `json:"file_name"`
+	Requests     uint   `json:"requests"`
+	Remaining    uint   `json:"remaining"`
+	Message      string `json:"message"`
+	ResetTime    string `json:"reset_time"`
+	ResetTimeUtc string `json:"reset_time_utc"`
 }
 
 type FileInfo struct {
